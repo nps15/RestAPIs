@@ -1,0 +1,74 @@
+- hosts: all
+  gather_facts: true
+  vars:    
+     # "TEST" is pre-prod and "PROD" is production
+     Environment: "PRE-PROD"
+     ServerPlatform: "Microsoft"
+  tasks:
+  - set_fact:      
+      msgansela: "The execution to retrieve details from vault started.\n"
+  - name: Get Credentials from Vault 
+    win_shell: |
+      $resp = Invoke-RestMethod -Method Get -Uri {{ VaultURL }} -Headers @{'X-Vault-Token'= "{{ VaultToken }}"} -ContentType 'application/json'
+      Write-host $resp.data.Url
+      Write-host $resp.data.Password
+      Write-host $resp.data.UserName      
+    register: Resp    
+    ignore_errors: yes
+  - set_fact:      
+      ElasticUserId: "{{ Resp.stdout_lines[Resp.stdout_lines | length - 1] }}"        
+      ElasticPassword: "{{ Resp.stdout_lines[Resp.stdout_lines | length - 2] }}"
+      ElasticUrl: "{{ Resp.stdout_lines[Resp.stdout_lines | length - 3] }}"
+      msgelastic: "The {{ ansibleJobName }} was completed successfully with details: \n\n{{ serverrestartresults }}"
+      ignore_errors: yes
+  - set_fact:      
+      msgansela: "{{ msgansela }}The execution to retrieve details from vault failed. \n"
+    when: (Resp.stderr is defined) and (Resp.stderr != "")
+  - set_fact:      
+      msgansela: "{{ msgansela }}The execution to retrieve details from vault succeeded. \n"
+    when: (Resp.stderr is defined) and (Resp.stderr == "")
+  - set_fact:      
+      msgansela: "{{ msgansela }}The execution to sent logs to elastic started. \n"
+  - name: Post status back to Moog
+    win_shell: |
+      $username = "{{ ElasticUserId }}"
+      $password = "{{ ElasticPassword }}"
+      $pair = "${username}:${password}"
+      $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+      $base64 = [System.Convert]::ToBase64String($bytes)
+      $basicAuthValue = "Basic $base64"
+      $executiondate = (Get-Date).AddHours(4).ToString('yyyy-MM-dd HH:mm:ss')
+      $Url = "{{ ElasticUrl }}"
+      $Body = @{
+       executionDate = $executiondate;
+       source = "Ansible";
+       name = "{{ ansibleJobName }}";
+       status = "Success";
+       description = "{{ msgelastic }}";
+       applicationCode = "WRV0"} | ConvertTo-Json
+      Write-Output $Body
+      $headers = @{
+      'Content-Type' = 'application/json'
+       Authorization = $basicAuthValue
+      } 
+      [Net.ServicePointManager]::SecurityProtocol = "tls12, tls11, tls"
+      [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $True }
+      $result = Invoke-WebRequest  -Method Post -Uri $Url -Headers $headers -Body $Body -ContentType application/json 
+      Write-Output $result.StatusCode
+    register: responsecode
+    ignore_errors: yes
+  - set_fact:      
+      msgansela: "{{ msgansela }}The logs were successfully sent to Elastic. \n"
+    when: responsecode.stdout_lines[responsecode.stdout_lines | length - 1] == "201" 
+  - set_fact:      
+      msgansela: "{{ msgansela }}The execution of script to send logs to Elastic failed. The logs were not sent to Elastic. \n"
+    when: responsecode.stdout_lines[responsecode.stdout_lines | length - 1] != "201" 
+  - name: "Artifact URL of test results to Tower Workflows"
+    set_stats:
+      data:
+        msg: "The {{ ansibleJobName }} was completed successfully with details: \n\n{{ serverrestartresults }} \n{{ msgansela }}"
+      aggregate: 
+  - name: "Fail script if connection timeout error"
+    fail:
+      msg: The server restart failed
+    when: responsecode.stdout_lines[responsecode.stdout_lines | length - 1] != "201" 
